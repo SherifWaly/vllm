@@ -16,6 +16,38 @@ Depending on the use case, there are two possible strategies:
 
 Both approaches are under active development.
 
+**Kimi K3.1 experimental prefill path.** The NVIDIA implementation can combine
+TP1 with PCP and DCP spanning the same group. The intended prefill layouts are
+PCP8/DCP8 and PCP16/DCP16 on SM10x GPUs with a shared NVLink domain. Routed
+experts can use expert parallelism or tensor sharding across the PCP group.
+`FLASHINFER_MLA_SPARSE` supports this TP1/PCP=DCP layout with per-tensor FP8
+(`fp8` or `fp8_e4m3`) D576 KV. `FLASHMLA_SPARSE` remains available with
+`fp8_ds_mla` KV. Use BF16 recurrent state and FP8 indexer keys. DCP `a2a` is
+supported for TP1/PCP=DCP, including restoring all heads for replicated decode
+queries; other PCP/DCP layouts still require `ag_rs`.
+
+The hybrid path requires PP1. Prefills run without CUDA graphs; decode-only
+graphs (`FULL_DECODE_ONLY`) are supported. Speculative decoding and sharded
+decode requests are not supported.
+
+KDA prefills exchange convolution boundaries and affine state summaries, then scan
+each local segment from its reconstructed initial state. Build the FlashKDA/KCP
+extension and the pinned DeepGEMM dependencies with the matching vLLM sources;
+replacing Python files over an older wheel can leave incompatible native APIs.
+The generic MLA wrapper retains its model-specific PCP/DCP admission requirement.
+FlashInfer PCP prefills gather byte-preserved FP8 KV shards into bounded
+workspaces and remap each local query's sparse indices into that gathered context.
+
+Recurrent state stays replicated across PCP ranks. Block-aligned prefix caching
+is available, while KDA's optional internal fine-grained checkpoint export is
+disabled on this path. Measure actual cache reuse, newly computed input tokens/s,
+and total logical input tokens/s together. TP1 also replicates non-expert weights,
+and the KCP exchange workspace grows with PCP width and the maximum request count;
+its buffers are allocated before memory profiling. An eight-GPU recipe may need
+compatible projection quantization to leave room for runtime buffers and cache.
+Qualify the exact endpoint, offload capacity and workload before deployment.
+NIXL handoff of Kimi's packed hybrid cache requires separate validation.
+
 ## Decode Context Parallel
 
 Due to the auto-regressive nature of decoding, every decoding step needs to compute a small amount of query tokens w.r.t. a large number of key/value tokens stored in the paged KV cache. The core of decode context parallel is how to shard the KV cache across GPUs.

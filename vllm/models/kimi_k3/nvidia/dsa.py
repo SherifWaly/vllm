@@ -22,6 +22,7 @@ from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -415,6 +416,14 @@ class KimiK3DSAIndexer(nn.Module):
         )
 
 
+class KimiK3SparseMLAAttention(MLAAttention):
+    supports_pcp_dcp = True
+
+
+class KimiK3SparseMLAWrapper(MultiHeadLatentAttentionWrapper):
+    attention_cls = KimiK3SparseMLAAttention
+
+
 class KimiK3DSAAttention(nn.Module):
     """Kimi K3.1 DSA (DeepSeek Sparse Attention) inference path.
 
@@ -656,7 +665,7 @@ class KimiK3DSAAttention(nn.Module):
             is_sparse=True,
             topk_indices_buffer=self.topk_indices_buffer,
         )
-        self.mla_attn = MultiHeadLatentAttentionWrapper(
+        self.mla_attn = KimiK3SparseMLAWrapper(
             self.hidden_size,
             self.num_local_heads,
             self.scaling,

@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
         KDARecoverSSMCommitContext,
     )
+    from vllm.v1.worker.gpu.pcp_manager import HybridPCPLayout
 
 
 @cache
@@ -259,6 +260,7 @@ class KDARecoverSSMCommitMetadata:
 
 @dataclass
 class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+    pcp_layout: "HybridPCPLayout | None" = None
     spec_token_start: int | None = None
     non_spec_token_start: int | None = None
     flashinfer_prefill_query_start_loc: torch.Tensor | None = None

@@ -13,7 +13,7 @@ import torch
 from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
@@ -23,11 +23,13 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionLayer,
     AttentionType,
+    CommonAttentionMetadata,
     MLAAttentionImpl,
     MultipleOf,
     max_decode_query_len,
@@ -37,9 +39,16 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     align_blocks_to_rows,
     flat_kv_row_view,
     prepare_sparse_mla_safe_lengths,
+    triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.ops.metadata import compute_token_to_req_indices
+from vllm.v1.attention.ops.pcp import max_pcp_rank_tokens
+from vllm.v1.attention.ops.pcp_sparse import (
+    PCPSparsePrefillPlan,
+    build_pcp_sparse_prefill_plan,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, is_quantized_kv_cache
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -134,11 +143,14 @@ class FlashInferMLASparseTRTLLMBackend(_FlashInferMLASparseBackendBase):
             parallel_config.prefill_context_parallel_size > 1
             and parallel_config.decode_context_parallel_size > 1
         ):
-            return (
-                f"{cls.get_name()} does not support combined PCP+DCP; "
-                "use FLASHMLA_SPARSE, which gathers each DCP KV shard before "
-                "running the rank-local PCP prefill queries"
-            )
+            if (
+                parallel_config.tensor_parallel_size != 1
+                or parallel_config.prefill_context_parallel_size
+                != parallel_config.decode_context_parallel_size
+            ):
+                return "FlashInfer sparse PCP+DCP requires TP1 and PCP=DCP"
+            if kv_cache_dtype not in ("fp8", "fp8_e4m3") or head_size != 576:
+                return "FlashInfer sparse PCP+DCP requires per-tensor FP8 D576 KV"
         if kv_cache_dtype == "fp8_ds_mla":
             return f"{cls.get_name()} SM10 does not support fp8_ds_mla kv-cache dtype"
         if kv_cache_dtype == "nvfp4_ds_mla":
@@ -266,6 +278,8 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 class FlashInferMLASparseMetadata(SparseMLACommonMetadata):
     """Attention metadata for FlashInfer MLA Sparse backend."""
 
+    pcp_prefill: PCPSparsePrefillPlan | None = None
+
 
 class FlashInferMLASparseMetadataBuilder(
     SparseMLACommonMetadataBuilder[FlashInferMLASparseMetadata]
@@ -290,6 +304,8 @@ class FlashInferMLASparseMetadataBuilder(
         threshold = {8: 128, 16: 128, 32: 128, 64: 256, 128: 1024}.get(
             num_q_heads, 1024
         )
+        if self.use_pcp:
+            threshold = max_decode_query_len(vllm_config)
         self._init_reorder_batch_threshold(
             threshold,
             supports_spec_as_decode=True,
@@ -340,17 +356,48 @@ class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilde
             )
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             if self.dcp_world_size > 1:
+                lse_tokens = max_tokens
+                if self.use_pcp:
+                    lse_tokens = (
+                        vllm_config.scheduler_config.max_num_seqs
+                        * max_decode_query_len(vllm_config)
+                    )
                 _get_workspace_buffer(
                     device,
                     _required_workspace_bytes(
-                        self.dcp_world_size, num_q_heads, max_tokens
+                        self.dcp_world_size,
+                        num_q_heads,
+                        lse_tokens,
+                        query_head_multiplier=1 if self.use_pcp else None,
                     ),
                 )
             _reserve_kv_counters(
                 device,
                 max_tokens,
-                trtllm_gen_query_heads(num_q_heads * self.dcp_world_size),
+                trtllm_gen_query_heads(
+                    num_q_heads * (1 if self.use_pcp else self.dcp_world_size)
+                ),
             )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> FlashInferMLASparseMetadata:
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if self.use_pcp and self.dcp_world_size > 1:
+            world = self.dcp_world_size
+            metadata.pcp_prefill = build_pcp_sparse_prefill_plan(
+                common_attn_metadata,
+                metadata.num_decodes,
+                world,
+                get_dcp_group().rank_in_group,
+                metadata.cp_kv_cache_interleave_size,
+                metadata.block_size,
+                round_up(self.vllm_config.model_config.max_model_len, world * 32),
+            )
+        return metadata
 
     def update_draft_decode_metadata(
         self, metadata: FlashInferMLASparseMetadata
@@ -398,6 +445,8 @@ def compute_trtllm_sparse_mla_workspace_bytes(
     dcp_world_size: int,
     num_heads_per_rank: int,
     max_num_batched_tokens: int,
+    *,
+    query_head_multiplier: int | None = None,
 ) -> int:
     """Workspace bytes needed by the trtllm-gen sparse MLA decode kernel.
 
@@ -411,12 +460,22 @@ def compute_trtllm_sparse_mla_workspace_bytes(
     returned unchanged. A launch covers at most ``_TRTLLM_GEN_MAX_REQUESTS``
     tokens, and launches run in order on one stream, so larger batches reuse
     the same slab.
+
+    ``query_head_multiplier`` describes queries already carrying all heads
+    under PCP; those must not be expanded by the DCP width again.
     """
     if dcp_world_size <= 1:
         return base_workspace_bytes
     softmax_bytes = (
         _TRTLLM_GEN_SOFTMAX_STAT_BYTES
-        * trtllm_gen_query_heads(num_heads_per_rank * dcp_world_size)
+        * trtllm_gen_query_heads(
+            num_heads_per_rank
+            * (
+                dcp_world_size
+                if query_head_multiplier is None
+                else query_head_multiplier
+            )
+        )
         * min(max_num_batched_tokens, _TRTLLM_GEN_MAX_REQUESTS)
         * _TRTLLM_GEN_SOFTMAX_SLOTS_PER_TOKEN
         + _TRTLLM_GEN_SOFTMAX_GUARD_BYTES
@@ -428,6 +487,8 @@ def _required_workspace_bytes(
     dcp_world_size: int,
     num_heads_per_rank: int,
     max_num_batched_tokens: int,
+    *,
+    query_head_multiplier: int | None = None,
 ) -> int:
     """Resolve the workspace size, honoring an explicit env override."""
     computed = compute_trtllm_sparse_mla_workspace_bytes(
@@ -435,6 +496,7 @@ def _required_workspace_bytes(
         dcp_world_size,
         num_heads_per_rank,
         max_num_batched_tokens,
+        query_head_multiplier=query_head_multiplier,
     )
     if not envs.is_set("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE"):
         return computed
@@ -799,6 +861,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """
 
     use_prims_ts: bool = False
+    pcp_dcp_kv_gather: bool = False
 
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
@@ -870,6 +933,23 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # dynamic scale cannot reach the kernel's host-scalar softmax scale in a
         # CUDA graph) before the DCP query all-gather.
         vllm_config = get_current_vllm_config()
+        self.pcp_dcp_kv_gather = (
+            vllm_config.parallel_config.prefill_context_parallel_size > 1
+            and self.dcp_world_size > 1
+        )
+        self._pcp_gathered_kv: torch.Tensor | None = None
+        if self.pcp_dcp_kv_gather:
+            max_rows = round_up(
+                vllm_config.model_config.max_model_len, self.dcp_world_size * 32
+            )
+            self._pcp_gathered_kv = current_workspace_manager().get_persistent_resource(
+                ("flashinfer_pcp_kv", max_rows, head_size, self.dcp_world_size),
+                lambda: get_dcp_group().all_gather_buffer(
+                    (max_rows // self.dcp_world_size, head_size),
+                    torch.uint8,
+                    key="flashinfer_pcp_kv",
+                )[0],
+            )
         self.use_prims_ts = use_prims_ts(vllm_config, kv_cache_dtype)
         if self.use_prims_ts:
             # prims_ts returns natural-log LSE; (0, -inf) for rows without
@@ -921,7 +1001,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     def reserve_workspace(self) -> None:
         if not self.use_prims_ts:
             return
-        heads = self.num_heads * self.dcp_world_size
+        heads = self.num_heads * (1 if self.pcp_dcp_kv_gather else self.dcp_world_size)
         # ShardQ steps attend their token slice with every TP rank's heads.
         shardq_heads = self.num_heads * get_tensor_model_parallel_world_size()
         # Plan (and compile) every row capacity before serving starts.
@@ -941,6 +1021,13 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # A ShardQ step attends only this rank's token slice, with every head.
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        if self.pcp_dcp_kv_gather:
+            max_tokens = max_pcp_rank_tokens(
+                max_tokens,
+                vllm_config.scheduler_config.max_num_seqs,
+                self.dcp_world_size,
+                max_decode_query_len(vllm_config),
+            )
         steps = [(max_tokens, heads)]
         if self.use_shardq:
             # A rank owns at most two chunks of ceil(n / (2 * world)) per
@@ -951,6 +1038,91 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             steps.append((rank_tokens, shardq_heads))
         peak = max(self._prims_ts_peak_bytes(*step) for step in steps)
         _ = torch.empty(peak, dtype=torch.uint8, device=current_platform.device_type)
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self.pcp_dcp_kv_gather:
+            return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+        assert isinstance(q, torch.Tensor)
+        nd = min(attn_metadata.num_decode_tokens, q.shape[0])
+        if nd == q.shape[0]:
+            return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+        plan = attn_metadata.pcp_prefill
+        assert plan is not None and self._pcp_gathered_kv is not None
+        assert self.topk_indices_buffer is not None
+        output = torch.empty(
+            (q.shape[0], q.shape[1], self.kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        lse = torch.empty((0, q.shape[1]), dtype=torch.float32, device=q.device)
+        if nd:
+            decoded, decode_lse = super().forward_mqa(
+                q[:nd], kv_c_and_k_pe_cache, attn_metadata, layer
+            )
+            assert decode_lse is not None
+            output[:nd] = decoded
+            lse = decode_lse
+
+        rows, stride_rows = flat_kv_row_view(
+            kv_c_and_k_pe_cache, attn_metadata.block_size
+        )
+        rows = rows.view(torch.uint8)
+        group = get_dcp_group()
+        for chunk in plan.chunks:
+            gathered = self._pcp_gathered_kv[: group.world_size * chunk.shard_rows]
+            local = gathered[
+                group.rank_in_group * chunk.shard_rows : (group.rank_in_group + 1)
+                * chunk.shard_rows
+            ]
+            slots = chunk.block_ids * stride_rows + chunk.offsets
+            slots = torch.where(chunk.valid, slots, 0)
+            count = slots.numel()
+            torch.index_select(rows, 0, slots, out=local[:count])
+            local[:count].masked_fill_(~chunk.valid[:, None], 0)
+            local[count:].zero_()
+            group.all_gather_in_place(gathered)
+
+            tokens = chunk.tokens
+            topk = self.topk_indices_buffer[
+                attn_metadata.topk_start + tokens.start : attn_metadata.topk_start
+                + tokens.stop
+            ]
+            indices, valid_counts = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token[tokens],
+                attn_metadata.block_table,
+                topk,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk.shape[1],
+                HAS_PREFILL_WORKSPACE=True,
+                prefill_workspace_request_ids=plan.request_ids[tokens],
+                prefill_workspace_starts=plan.workspace_starts,
+                prefill_workspace_rank_stride=chunk.shard_rows,
+                dcp_size=group.world_size,
+                dcp_rank=group.rank_in_group,
+                cp_kv_cache_interleave_size=attn_metadata.cp_kv_cache_interleave_size,
+                return_valid_counts=True,
+            )
+            chunk_output, _ = self._forward_mqa_kernel(
+                q[tokens],
+                gathered.view(kv_c_and_k_pe_cache.dtype).view(
+                    -1, 32, gathered.shape[-1]
+                ),
+                indices,
+                valid_counts,
+                layer=layer,
+                block_size=32,
+                is_decode=False,
+                return_lse=False,
+            )
+            output[tokens] = chunk_output
+        # Only replicated decode queries need an LSE merge across DCP ranks.
+        return output, lse
 
     def _prims_ts_peak_bytes(self, num_tokens: int, heads: int) -> int:
         padded = self._prims_ts_query_heads(heads)

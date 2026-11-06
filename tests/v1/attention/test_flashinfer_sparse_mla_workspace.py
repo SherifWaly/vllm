@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only tests for FlashInfer sparse MLA backend constraints."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from vllm.config import ModelConfig, ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     _DEFAULT_WORKSPACE_BUFFER_SIZE,
     FlashInferMLASparseTRTLLMBackend,
@@ -79,29 +82,67 @@ def test_dcp_size_is_capped_at_one_launch():
     assert above_limit == at_limit
 
 
-def test_combined_pcp_dcp_rejects_flashinfer_sparse():
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=4,
-            decode_context_parallel_size=4,
-        ),
-        model_config=None,
+@pytest.mark.parametrize("world", [8, 16])
+def test_pcp_full_heads_do_not_expand_the_lse_workspace(world):
+    actual = compute_trtllm_sparse_mla_workspace_bytes(
+        0, world, 96, 64, query_head_multiplier=1
     )
-    with patch("vllm.config.get_current_vllm_config", return_value=config):
+    assert actual == 8 * 128 * 64 * 256 + 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "tp,pcp,dcp,cache,allowed",
+    [(1, 8, 8, "fp8", True), (2, 4, 8, "fp8", False), (1, 8, 8, "fp8_ds_mla", False)],
+)
+def test_combined_pcp_dcp_sparse_admission(tmp_path, tp, pcp, dcp, cache, allowed):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v3",
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 96,
+                "num_key_value_heads": 96,
+                "qk_nope_head_dim": 128,
+                "qk_rope_head_dim": 64,
+                "kv_lora_rank": 512,
+                "index_topk": 2048,
+                "max_position_embeddings": 2048,
+                "vocab_size": 128,
+            }
+        )
+    )
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=tp,
+            prefill_context_parallel_size=pcp,
+            decode_context_parallel_size=dcp,
+            distributed_executor_backend="external_launcher",
+        ),
+        model_config=ModelConfig(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            enforce_eager=True,
+            dtype="bfloat16",
+            max_model_len=2048,
+        ),
+    )
+    with set_current_vllm_config(config):
         reason = FlashInferMLASparseTRTLLMBackend.supports_combination(
             head_size=576,
             dtype=torch.bfloat16,
-            kv_cache_dtype="fp8",
+            kv_cache_dtype=cache,
             block_size=64,
             use_mla=True,
             has_sink=False,
             use_sparse=True,
             use_mm_prefix=False,
-            device_capability=SimpleNamespace(major=10),
+            device_capability=DeviceCapability(10, 3),
         )
 
-    assert reason is not None
-    assert "use FLASHMLA_SPARSE" in reason
+    assert (reason is None) is allowed
 
 
 @pytest.mark.parametrize("pcp_size,dcp_size", [(4, 1), (1, 4)])
@@ -187,6 +228,7 @@ def test_prims_ts_shardq_reserves_the_rank_slice():
     """A prims_ts ShardQ step attends cdiv(T, tp) + 2 * max_num_seqs tokens
     with every head; the profile reservation covers that slice, not all T
     tokens with every head."""
+    from vllm.utils.flashinfer import prims_ts_sparse_mla_schedules_native_heads
     from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fi
 
     impl = object.__new__(fi.FlashInferMLASparseImpl)
@@ -213,9 +255,10 @@ def test_prims_ts_shardq_reserves_the_rank_slice():
     ):
         impl.reserve_workspace()
 
-    # 96 heads pad to 128 in 4096-row chunks; the step output holds the
-    # rank's 4096 + 2 * 64 tokens.
-    shardq_peak = 4096 * 128 * (512 + 64 + 1024 + 4) + 4224 * 96 * 512 * 2
+    # New FlashInfer builds schedule 96 heads natively. The step output still
+    # holds only the rank's 4096 + 2 * 64 tokens on either build.
+    padded_heads = 96 if prims_ts_sparse_mla_schedules_native_heads() else 128
+    shardq_peak = 4096 * padded_heads * (512 + 64 + 1024 + 4) + 4224 * 96 * 512 * 2
     head_sharded_peak = 4096 * 12 * (512 + 64 + 1024 + 4) + 32768 * 12 * 512 * 2
     assert reserved == [max(shardq_peak, head_sharded_peak)]
     assert reserved[0] < 4096 * 128 * 1604 + 32768 * 96 * 512 * 2

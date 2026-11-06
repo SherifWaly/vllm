@@ -679,8 +679,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             replicated = not spec.dcp_sharded
             if pcp_world_size > 1:
                 assert isinstance(spec, FullAttentionSpec) or (
-                    isinstance(spec, AttentionSpec) and replicated
-                ), "PCP only supports full attention and replicated draft groups."
+                    isinstance(spec, (AttentionSpec, MambaSpec)) and replicated
+                ), "PCP requires full attention or replicated state/draft groups."
             if dcp_world_size > 1:
                 assert isinstance(spec, FullAttentionSpec) or replicated, (
                     "DCP with hybrid KV cache layouts only supports "

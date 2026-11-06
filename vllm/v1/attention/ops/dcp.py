@@ -1571,11 +1571,16 @@ class MLADCPManager:
     ) -> DCPCombine:
         direct_workspace = None
         if self.use_a2a:
+            scatter_heads = num_heads
+            if use_pcp:
+                if num_heads % self.group.world_size:
+                    raise ValueError("PCP A2A requires heads divisible by DCP size")
+                scatter_heads //= self.group.world_size
             direct_workspace = get_direct_dcp_a2a_workspace(
                 self.group,
                 self.device,
                 self.max_num_tokens,
-                num_heads,
+                scatter_heads,
                 head_dim,
                 dtype,
                 self.num_ubatches,
@@ -1585,24 +1590,46 @@ class MLADCPManager:
             logger.info_once("Using direct symmetric-memory DCP A2A for MLA.")
             if enable_jit_warmup:
                 direct_workspace.register_warmup()
-            return functools.partial(
+            combine = functools.partial(
                 self._direct_workspace_combine,
                 direct_workspace,
                 is_lse_base_on_e=is_lse_base_on_e,
             )
+        else:
+            combine_fn = (
+                dcp_a2a_lse_reduce
+                if self.use_a2a
+                else cp_lse_ag_out_ar
+                if use_pcp
+                else cp_lse_ag_out_rs
+            )
+            combine = functools.partial(
+                combine_fn,
+                cp_group=self.group,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
+        if use_pcp and self.use_a2a:
+            # PCP decode queries already carry every head on every rank. A2A
+            # merges into head shards; restore the replicated-head contract.
+            return functools.partial(self._pcp_a2a_combine, combine)
+        return combine
 
-        combine_fn = (
-            dcp_a2a_lse_reduce
-            if self.use_a2a
-            else cp_lse_ag_out_ar
-            if use_pcp
-            else cp_lse_ag_out_rs
+    def _pcp_a2a_combine(
+        self,
+        combine: DCPCombine,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        *,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        head_shard = combine(
+            partial_output,
+            partial_lse,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
         )
-        return functools.partial(
-            combine_fn,
-            cp_group=self.group,
-            is_lse_base_on_e=is_lse_base_on_e,
-        )
+        return self.group.all_gather(head_shard, dim=1)
 
     def _direct_workspace_combine(
         self,

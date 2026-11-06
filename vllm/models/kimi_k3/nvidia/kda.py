@@ -51,6 +51,7 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
+from vllm.models.kimi_k3.nvidia.ops import kcp
 from vllm.models.kimi_k3.nvidia.ops.kda_conv import (
     packed_causal_conv1d_fn,
     packed_causal_conv1d_supported,
@@ -606,6 +607,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         run_gemm_rs_ar: bool = False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         self.use_recoverssm = self.cache_config.use_kda_recoverssm
         if self.cache_config.use_replayssm and not self.use_recoverssm:
             raise ValueError(
@@ -916,11 +918,36 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        self.kcp_buffers: kcp.KcpCollectiveBuffers | None = None
+        if self.use_pcp:
+            max_requests = vllm_config.scheduler_config.max_num_seqs
+            self.kcp_buffers = current_workspace_manager().get_persistent_resource(
+                (
+                    "kimi_kcp_collectives",
+                    max_requests,
+                    self.local_num_heads,
+                    self.head_dim,
+                    self.conv_size,
+                    self.model_config.dtype,
+                ),
+                lambda: kcp.KcpCollectiveBuffers.allocate(
+                    max_requests,
+                    self.local_num_heads,
+                    self.head_dim,
+                    self.conv_size - 1,
+                    self.model_config.dtype,
+                ),
+            )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
         alignment = kda_prefill_checkpoint_alignment(self.kda_prefill_backend)
+        if self.use_pcp:
+            # KCP commits the completed query state on every rank. Reuse the
+            # scheduler's aligned block checkpoints; the optional internal
+            # fine-grained checkpoint is not exported by the segmented scan.
+            alignment = None
         return replace(
             spec,
             num_prefill_checkpoint_blocks=int(alignment is not None),
@@ -990,6 +1017,93 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
             return self.gemm_rs_ar.apply(core_attn_out, self.o_proj)
         return self.o_proj(core_attn_out)[0]
+
+    def _forward_kcp(
+        self,
+        layout,
+        mixed_qkv: torch.Tensor,
+        g1: torch.Tensor,
+        g2: torch.Tensor,
+        beta: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ) -> None:
+        from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+            fused_recurrent_kda_packed_decode,
+        )
+
+        conv_state, recurrent_state = self.kv_cache[:2]
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        conv_weights = self.conv1d.weight.view(-1, self.conv_size)
+        plan = kcp.plan_for(layout, self.conv_size - 1)
+        assert self.kcp_buffers is not None
+        self.kcp_buffers.bind(plan)
+        num_decodes = layout.num_decode_tokens
+        num_tokens = num_decodes + layout.num_prefill_tokens
+        core_attn_out[:, num_tokens:].zero_()
+
+        def reshape(x: torch.Tensor) -> torch.Tensor:
+            return x.reshape(1, -1, self.local_num_heads, self.head_dim)
+
+        if num_decodes:
+            assert layout.decode_slots is not None
+            qkv = causal_conv1d_update(
+                mixed_qkv[:num_decodes],
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                activation="silu",
+                conv_state_indices=layout.decode_slots,
+                out=torch.empty_like(mixed_qkv[:num_decodes]),
+            )
+            fused_recurrent_kda_packed_decode(
+                mixed_qkv=qkv,
+                raw_g=g1[:, :num_decodes],
+                raw_beta=beta[:, :num_decodes],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                lower_bound=self.gate_lower_bound,
+                initial_state=recurrent_state,
+                state_indices=layout.decode_slots,
+                out=core_attn_out[:, :num_decodes],
+            )
+
+        prefill = slice(num_decodes, num_tokens)
+        slots = layout.prefill_slots
+        assert slots is not None
+        tails = kcp.gather_conv_tails(plan, mixed_qkv[prefill])
+        windows = kcp.conv_windows(plan, tails, conv_state, slots)
+        segments = None
+        if layout.num_prefill_tokens:
+            qkv = causal_conv1d_fn(
+                mixed_qkv[prefill].transpose(0, 1),
+                conv_weights,
+                self.conv1d.bias,
+                activation="silu",
+                conv_states=windows,
+                has_initial_state=plan.segment_has_initial_state,
+                cache_indices=plan.segment_ids,
+                query_start_loc=layout.scan_cu_seqlens,
+                metadata=plan.conv_metadata,
+            ).transpose(0, 1)
+            q, k, v = (reshape(x) for x in qkv.split(self.local_projection_size, -1))
+            assert self.gate_lower_bound is not None
+            segments = kcp.prepare_segments(
+                plan,
+                q,
+                k,
+                v,
+                g1[:, prefill],
+                beta[:, prefill],
+                self.A_log,
+                self.dt_bias,
+                self.gate_lower_bound,
+            )
+        kcp.conv_windows(plan, tails, conv_state, slots, final=True)
+        kcp.exchange_and_scan(
+            plan, segments, recurrent_state, slots, core_attn_out[:, prefill]
+        )
+        core_attn_out.copy_(self.o_norm(core_attn_out, g2))
 
     def _recoverssm_verify(
         self,
@@ -1105,6 +1219,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             return
         assert isinstance(attn_metadata_narrowed, KimiK3KDAMetadata)
         m = attn_metadata_narrowed
+        if m.pcp_layout is not None:
+            self._forward_kcp(m.pcp_layout, mixed_qkv, g1, g2, beta, core_attn_out)
+            return
         has_initial_state = m.has_initial_state
         non_spec_query_start_loc = m.non_spec_query_start_loc
         non_spec_state_indices_tensor = m.non_spec_state_indices_tensor
