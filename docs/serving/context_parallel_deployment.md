@@ -24,7 +24,38 @@ experts can use expert parallelism or tensor sharding across the PCP group.
 (`fp8` or `fp8_e4m3`) D576 KV. `FLASHMLA_SPARSE` remains available with
 `fp8_ds_mla` KV. Use BF16 recurrent state and FP8 indexer keys. DCP `a2a` is
 supported for TP1/PCP=DCP, including restoring all heads for replicated decode
-queries; other PCP/DCP layouts still require `ag_rs`.
+queries. The existing FlashMLA `ag_rs` path is retained. Other Kimi PCP/DCP
+layouts are outside this qualification.
+
+PCP is opt-in: `--prefill-context-parallel-size` defaults to `1`. For an existing
+16-GPU Kimi K3.1 launch, use the following serving arguments. Keep the launcher's
+model-loading, multi-node and CPU-offload configuration; these arguments select
+the context-parallel path rather than describing a complete cluster deployment.
+
+```text
+--tensor-parallel-size 1
+--pipeline-parallel-size 1
+--prefill-context-parallel-size 16
+--decode-context-parallel-size 16
+--enable-expert-parallel
+--moe-backend deep_gemm_mega_moe
+--attention-backend FLASHINFER_MLA_SPARSE
+--kv-cache-dtype fp8
+--mamba-ssm-cache-dtype bfloat16
+--attention-config '{"mla_prefill_backend":"TRTLLM_RAGGED","use_prefill_query_quantization":true,"indexer_kv_dtype":"fp8"}'
+--dcp-comm-backend a2a
+--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
+--max-num-batched-tokens 16384
+--max-num-seqs 32
+--enable-prefix-caching
+--mamba-cache-mode align
+--prefix-match-unit 128
+--no-enable-flashinfer-autotune
+```
+
+For eight GPUs, set both context-parallel sizes to `8` and qualify the memory
+settings and any projection quantization separately. The example selects its
+backends explicitly; ordinary Kimi deployments retain their existing defaults.
 
 The hybrid path requires PP1. Prefills run without CUDA graphs; decode-only
 graphs (`FULL_DECODE_ONLY`) are supported. Speculative decoding and sharded
@@ -34,6 +65,10 @@ KDA prefills exchange convolution boundaries and affine state summaries, then sc
 each local segment from its reconstructed initial state. Build the FlashKDA/KCP
 extension and the pinned DeepGEMM dependencies with the matching vLLM sources;
 replacing Python files over an older wheel can leave incompatible native APIs.
+Use the [incremental native-build instructions](../contributing/incremental_build.md).
+The tested K3.1 base pins FlashKDA to `9d9e928edc42475a67a523dd37814540d105f51c`
+and DeepGEMM to `82ca617e5879d0efb0aba5b91b1c81852588af6f`; use the dependency
+revisions declared by the checkout being built.
 The generic MLA wrapper retains its model-specific PCP/DCP admission requirement.
 FlashInfer PCP prefills gather byte-preserved FP8 KV shards into bounded
 workspaces and remap each local query's sparse indices into that gathered context.
@@ -49,6 +84,10 @@ Qualify the exact endpoint, offload capacity and workload before deployment.
 NIXL handoff of Kimi's packed hybrid cache requires separate validation.
 
 ## Decode Context Parallel
+
+The TP-based bounds in this section describe ordinary DCP with PCP size `1`.
+The combined Kimi path above instead uses a DCP group spanning its PCP ranks,
+which permits TP1 with PCP=DCP=8 or 16.
 
 Due to the auto-regressive nature of decoding, every decoding step needs to compute a small amount of query tokens w.r.t. a large number of key/value tokens stored in the paged KV cache. The core of decode context parallel is how to shard the KV cache across GPUs.
 
