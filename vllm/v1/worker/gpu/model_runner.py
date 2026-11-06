@@ -148,6 +148,7 @@ from vllm.v1.worker.gpu.lora_utils import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
@@ -780,6 +781,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if self.speculator is not None:
             self.speculator.pcp_manager = self.pcp_manager
+        if isinstance(self.model_state, MambaHybridModelState):
+            self.model_state.pcp_manager = self.pcp_manager
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
             self.kv_cache_config,
@@ -938,6 +941,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             f"Dummy run with {num_tokens} tokens exceeds max_num_batched_tokens "
             f"({self.max_num_tokens})"
         )
+
+        if self.pcp_manager is not None and not uniform_decode:
+            global_tokens = num_tokens
+            num_tokens = self.pcp_manager.max_local_tokens(
+                num_tokens, num_reqs, self.decode_query_len
+            )
+            if is_profile:
+                logger.info(
+                    "Profiling PCP with at most %d local tokens "
+                    "for a %d-token scheduled batch",
+                    num_tokens,
+                    global_tokens,
+                )
 
         # Distribute the remainder evenly so no dummy request exceeds
         # ceil(num_tokens / num_reqs) <= max_model_len tokens.
@@ -2242,6 +2258,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
             if self.pcp_manager is not None:
+                assert self.pcp_manager.global_batch is not None
                 input_batch = self.pcp_manager.global_batch
             assert self.pp_handler is not None
             all_decode_next = self.pp_handler.receive(

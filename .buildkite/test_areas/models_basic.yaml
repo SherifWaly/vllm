@@ -240,6 +240,21 @@ steps:
   source_file_dependencies:
   - vllm/models/kimi_k3/
   - csrc/kimi_k3/
+  - csrc/flashkda_kcp.cuh
+  - csrc/flashkda_registration.cpp
+  - cmake/external_projects/flashkda.cmake
+  - vllm/distributed/device_communicators/base_device_communicator.py
+  - vllm/distributed/device_communicators/cuda_communicator.py
+  - vllm/distributed/parallel_state.py
+  - vllm/model_executor/layers/mla.py
+  - vllm/v1/core/kv_cache_coordinator.py
+  - vllm/v1/worker/cp_utils.py
+  - vllm/v1/worker/gpu/model_runner.py
+  - vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+  - vllm/v1/worker/gpu/pcp_manager.py
+  - vllm/v1/attention/ops/pcp_sparse.py
+  - vllm/v1/attention/ops/dcp.py
+  - vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
   - tests/models/kimi_k3/
   - tests/kernels/attention/test_kimi_k3_mla_fused_epilogue.py
   commands:

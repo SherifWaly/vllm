@@ -8,6 +8,23 @@ from vllm.distributed.parallel_state import (
 )
 
 
+def max_pcp_rank_tokens(
+    num_tokens: int, num_reqs: int, world_size: int, decode_query_len: int = 1
+) -> int:
+    """Conservative local row bound for PCP's split/replicate policy.
+
+    With K=2P chunks, replication occurs when (K-1)*ceil(T/K) >= T.
+    Its largest prefill is therefore (K-1)^2 tokens, not merely K-1.
+    Split rows add fewer than two rounding tokens per request and rank.
+    """
+    replicated = max((2 * world_size - 1) ** 2, decode_query_len)
+    overhead = max(2, (replicated * (world_size - 1) + world_size - 1) // world_size)
+    return min(
+        num_tokens,
+        (num_tokens + world_size - 1) // world_size + num_reqs * overhead,
+    )
+
+
 def _gather_prefill_cache_inputs(
     tensors: tuple[torch.Tensor, ...],
     slot_mapping: torch.Tensor,

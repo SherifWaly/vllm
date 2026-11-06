@@ -129,6 +129,7 @@ from .specialized_decode.runtime import specialized_decode_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_states.interface import ModelState
+    from vllm.v1.worker.gpu.pcp_manager import HybridPCPLayout
 
     from .specialized_decode.runtime.decode import SpecializedDecode
 
@@ -1505,6 +1506,8 @@ class KimiLinearForCausalLM(
     SupportsEagle3,
     SupportsReplaySSM,
 ):
+    supports_hybrid_pcp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1536,6 +1539,11 @@ class KimiLinearForCausalLM(
         # The final norm is applied in compute_logits unless the specialized decode
         # applies it in forward.
         self.needs_norm_in_logits = True
+
+    def prepare_hybrid_pcp(self, layout: "HybridPCPLayout") -> None:
+        from .ops.kcp import plan_for
+
+        plan_for(layout, self.config.linear_attn_config["short_conv_kernel_size"] - 1)
 
     def process_weights_after_loading(self) -> None:
         # The specialized decode packs the DSA projections its own way.
@@ -1673,6 +1681,7 @@ class KimiK3ForConditionalGeneration(
 
     supports_encoder_tp_data = True
     supports_mm_device_do_normalize = True
+    supports_hybrid_pcp = True
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1775,6 +1784,9 @@ class KimiK3ForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
         self.media_placeholder: int = self.config.media_placeholder_token_id
+
+    def prepare_hybrid_pcp(self, layout: "HybridPCPLayout") -> None:
+        self.language_model.prepare_hybrid_pcp(layout)
 
     def process_weights_after_loading(self) -> None:
         self.language_model.process_weights_after_loading()

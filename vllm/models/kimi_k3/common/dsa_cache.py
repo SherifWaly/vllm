@@ -8,6 +8,7 @@ from dataclasses import replace
 import torch
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_pcp_group
 from vllm.model_executor.layers.sparse_attn_indexer import MXFP4_BLOCK_SIZE
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.platforms import current_platform
@@ -73,8 +74,6 @@ class KimiK3IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if self.use_pcp:
-            raise NotImplementedError("Kimi-K3.1 packed DSA caches with PCP")
         # The K3.1 key format, validated as KimiK3DSAIndexer selects it.
         self.indexer_uses_fp4 = kimi_k3_indexer_uses_fp4(self.vllm_config)
         if self.indexer_uses_fp4 and current_platform.is_rocm():
@@ -87,6 +86,15 @@ class KimiK3IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
             dtype=torch.int64,
             device=self.device,
         )
+        self.pcp_slot_mapping_buffer = (
+            torch.empty(
+                self.slot_mapping_buffer.numel() * get_pcp_group().world_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            if self.use_pcp
+            else None
+        )
 
     def build(
         self,
@@ -96,7 +104,7 @@ class KimiK3IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
     ) -> DeepseekV32IndexerMetadata:
         slot_mapping = get_compressed_slot_mapping(
             common_attn_metadata.num_actual_tokens,
-            common_attn_metadata.slot_mapping,
+            self._local_slot_mapping(common_attn_metadata.slot_mapping),
             common_attn_metadata.query_start_loc,
             common_attn_metadata.seq_lens,
             common_attn_metadata.block_table_tensor,
@@ -106,6 +114,23 @@ class KimiK3IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
             dcp_world_size=self.dcp_world_size,
             cp_interleave=self.cp_kv_cache_interleave_size,
         )
+        if self.use_pcp:
+            # Key insertion gathers rank-padded rows. Queries remain local;
+            # packed slot addresses must follow the gathered keys.
+            local_padded = (
+                common_attn_metadata.slot_mapping.numel() // get_pcp_group().world_size
+            )
+            local_slots = self.slot_mapping_buffer[:local_padded]
+            gathered = get_pcp_group().all_gather(local_slots, dim=0)
+            assert self.pcp_slot_mapping_buffer is not None
+            slot_mapping = self.pcp_slot_mapping_buffer[: gathered.numel()]
+            # CUDA graphs must keep the same cache-insertion pointer when the
+            # next batch changes request slots and DCP ownership masks.
+            slot_mapping.copy_(gathered)
+            # Cache block IDs are shared across model-parallel ranks. Reapply
+            # this writer's DCP ownership/replay mask after gathering addresses;
+            # gathering another rank's ownership mask would corrupt this shard.
+            slot_mapping.masked_fill_(common_attn_metadata.slot_mapping < 0, -1)
         metadata = super().build(
             common_prefix_len,
             replace(common_attn_metadata, slot_mapping=slot_mapping),
@@ -123,6 +148,15 @@ class KimiK3IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
                 self.cp_kv_cache_interleave_size,
             )
         return metadata
+
+    def _local_slot_mapping(self, slot_mapping: torch.Tensor) -> torch.Tensor:
+        if not self.use_pcp:
+            return slot_mapping
+        group = get_pcp_group()
+        assert slot_mapping.numel() % group.world_size == 0
+        # Derive logical packed addresses for all local query rows, including
+        # keys owned by another DCP rank. Ownership is applied after gathering.
+        return torch.zeros_like(slot_mapping.view(group.world_size, -1)[0])
 
 
 class KimiK3IndexerBackend(DeepseekV32IndexerBackend):
